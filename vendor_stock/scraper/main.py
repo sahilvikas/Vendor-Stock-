@@ -25,7 +25,7 @@ frappe.connect()
 frappe.set_user("Administrator")
 
 # Now import scrapers (after frappe is initialized)
-from vendor_stock.scraper import agora, linen_craft, ddecor
+from vendor_stock.scraper import agora, linen_craft, ddecor, sarom
 from vendor_stock.scraper.config import EMAIL_RECIPIENTS, LOW_STOCK_THRESHOLD
 
 # ==========================================
@@ -106,16 +106,8 @@ def sync_linen_craft_to_erp(products):
 
     now = frappe.utils.now()
     for item in erp_items:
-        erp_words = set(w.upper() for w in item.item_name.split() if len(w) > 2)
-        best_match = None
-        best_score = 0
-        for p in products:
-            sheet_words = set(w.upper() for w in p["name"].split() if len(w) > 2)
-            score = len(erp_words & sheet_words)
-            if score > best_score:
-                best_score = score
-                best_match = p
-        if best_match and best_score >= 2:
+        best_match, best_score = linen_craft.match_erp_to_lc(item.item_name, products)
+        if best_match:
             try:
                 frappe.db.set_value("Item", item.item_code, {
                     "custom_vendor_stock": best_match["available"],
@@ -172,11 +164,62 @@ def sync_ddecor_to_erp(results):
     return updated
 
 
+def sync_sarom_to_erp(matched_items):
+    """Update ERP items with Sarom stock data."""
+    log("  Syncing Sarom to ERP...")
+    updated = 0
+    now = frappe.utils.now()
+
+    for m in matched_items:
+        item_code = m.get("item_code", "")
+        if not item_code:
+            continue
+
+        if not frappe.db.exists("Item", item_code):
+            continue
+
+        status = m.get("status", "UNKNOWN")
+
+        # Sarom doesn't provide numeric stock, so we use status-based values
+        # IN_STOCK = 999 (available), LOW_STOCK = 1 (piece only), OUT_OF_STOCK = 0
+        if status == "IN_STOCK":
+            stock_val = 999
+        elif status == "LOW_STOCK":
+            stock_val = 1
+        else:
+            stock_val = 0
+
+        edd = m.get("edd", "")
+        edd_date = None
+        if edd:
+            try:
+                from datetime import datetime as dt
+                edd_date = dt.strptime(edd, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except:
+                pass
+
+        try:
+            frappe.db.set_value("Item", item_code, {
+                "custom_vendor_stock": stock_val,
+                "custom_vendor_stock_status": status,
+                "custom_vendor_stock_updated": now,
+                "custom_vendor_stock_price": "",
+                "custom_vendor_stock_edd": edd_date,
+            }, update_modified=False)
+            updated += 1
+        except Exception as e:
+            log(f"    Error updating {item_code}: {e}")
+
+    frappe.db.commit()
+    log(f"  Sarom: {updated}/{len(matched_items)} items updated in ERP")
+    return updated
+
+
 # ==========================================
 # EXCEL REPORT
 # ==========================================
-def generate_excel(agora_data, lc_data, ddecor_data):
-    """Generate Excel report with all 3 vendors."""
+def generate_excel(agora_data, lc_data, ddecor_data, sarom_data):
+    """Generate Excel report with all 4 vendors."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill
 
@@ -184,6 +227,7 @@ def generate_excel(agora_data, lc_data, ddecor_data):
 
     GREEN = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
     RED = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+    YELLOW = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
     HEADER_FONT = Font(bold=True, color="FFFFFF")
     HEADER_FILL = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
     BOLD = Font(bold=True)
@@ -206,6 +250,16 @@ def generate_excel(agora_data, lc_data, ddecor_data):
                 ws.cell(row=row_num, column=c).fill = fill
         except:
             pass
+
+    def color_row_sarom(ws, row_num, status, col_count):
+        if status == "OUT_OF_STOCK":
+            fill = RED
+        elif status == "LOW_STOCK":
+            fill = YELLOW
+        else:
+            fill = GREEN
+        for c in range(1, col_count + 1):
+            ws.cell(row=row_num, column=c).fill = fill
 
     wb = openpyxl.Workbook()
 
@@ -236,6 +290,14 @@ def generate_excel(agora_data, lc_data, ddecor_data):
     ws.append(["Out of Stock", ddecor_data.get("out_of_stock", 0)])
     ws.append(["Discontinued", ddecor_data.get("discontinued", 0)])
     ws.append(["Errors", ddecor_data.get("errors", 0)])
+    ws.append([])
+    ws.append(["SAROM"])
+    ws["A22"].font = BOLD
+    ws.append(["Total Matched", sarom_data.get("total", 0)])
+    ws.append(["In Stock", sarom_data.get("in_stock", 0)])
+    ws.append(["Out of Stock", sarom_data.get("out_of_stock", 0)])
+    ws.append(["Low Stock (Piece)", sarom_data.get("low_stock", 0)])
+    ws.append(["New Email", "Yes" if sarom_data.get("new_email") else "No"])
     ws.column_dimensions["A"].width = 20
     ws.column_dimensions["B"].width = 15
 
@@ -272,6 +334,20 @@ def generate_excel(agora_data, lc_data, ddecor_data):
         color_row(ws4, ws4.max_row, r.get("total_stock", ""), 8)
     auto_width(ws4)
 
+    # Sarom tab
+    ws5 = wb.create_sheet("Sarom")
+    ws5.append(["Item Code", "Item Name", "Collection", "Serial", "Status", "EDD", "Match Method"])
+    style_headers(ws5, 7)
+    for m in sarom_data.get("matched", []):
+        ws5.append([
+            m.get("item_code", ""), m.get("item_name", ""),
+            m.get("collection", ""), m.get("serial", ""),
+            m.get("status", ""), m.get("edd", ""),
+            m.get("method", "")
+        ])
+        color_row_sarom(ws5, ws5.max_row, m.get("status", ""), 7)
+    auto_width(ws5)
+
     excel_path = os.path.join(LOG_DIR, f"stock_report_{TIMESTAMP}.xlsx")
     wb.save(excel_path)
     log(f"  Excel saved: {excel_path}")
@@ -294,7 +370,7 @@ def create_scrape_log(triggered_by="Scheduled"):
     return doc
 
 
-def update_scrape_log(doc, agora_data, lc_data, ddecor_data, erp_updated, excel_path, errors):
+def update_scrape_log(doc, agora_data, lc_data, ddecor_data, sarom_data, erp_updated, excel_path, errors):
     """Update the scrape log with results."""
     doc.run_end = frappe.utils.now()
 
@@ -335,6 +411,18 @@ def update_scrape_log(doc, agora_data, lc_data, ddecor_data, erp_updated, excel_
     doc.ddecor_low_stock = ddecor_data.get("low_stock", 0)
     doc.ddecor_duration_mins = round(ddecor_data.get("duration", 0) / 60, 1)
 
+    # Sarom
+    try:
+        doc.sarom_status = "Success" if sarom_data.get("matched") else "Failed"
+        doc.sarom_total = sarom_data.get("total", 0)
+        doc.sarom_in_stock = sarom_data.get("in_stock", 0)
+        doc.sarom_out_of_stock = sarom_data.get("out_of_stock", 0)
+        doc.sarom_low_stock = sarom_data.get("low_stock", 0)
+        doc.sarom_duration_secs = sarom_data.get("duration", 0)
+    except Exception:
+        # Sarom fields may not exist on the DocType yet - skip gracefully
+        pass
+
     # ERP sync
     doc.erp_items_updated = erp_updated
     doc.erp_sync_status = "Success"
@@ -342,7 +430,8 @@ def update_scrape_log(doc, agora_data, lc_data, ddecor_data, erp_updated, excel_
     # Total
     doc.total_items_checked = (agora_data.get("total", 0) +
                                 lc_data.get("total", 0) +
-                                ddecor_data.get("total", 0))
+                                ddecor_data.get("total", 0) +
+                                sarom_data.get("total", 0))
 
     # Errors
     if errors:
@@ -364,7 +453,7 @@ def update_scrape_log(doc, agora_data, lc_data, ddecor_data, erp_updated, excel_
         doc.overall_status = "Failed"
 
     # Add items to child table
-    add_items_to_log(doc, agora_data, lc_data, ddecor_data)
+    add_items_to_log(doc, agora_data, lc_data, ddecor_data, sarom_data)
 
     # Attach Excel
     if excel_path and os.path.exists(excel_path):
@@ -388,7 +477,7 @@ def update_scrape_log(doc, agora_data, lc_data, ddecor_data, erp_updated, excel_
     log(f"  Scrape log updated: {doc.name} [{doc.overall_status}]")
 
 
-def add_items_to_log(doc, agora_data, lc_data, ddecor_data):
+def add_items_to_log(doc, agora_data, lc_data, ddecor_data, sarom_data):
     """Add scraped items to the child table with ERP item mapping."""
     import re
 
@@ -433,26 +522,24 @@ def add_items_to_log(doc, agora_data, lc_data, ddecor_data):
 
     # Linen Craft items
     for p in lc_data.get("products", []):
-        # match by keyword overlap
+        # match by keyword + fabric code
         best_item = None
         best_score = 0
-        sheet_words = set(w.upper() for w in p["name"].split() if len(w) > 2)
         for item in lc_erp:
-            erp_words = set(w.upper() for w in item.item_name.split() if len(w) > 2)
-            score = len(erp_words & sheet_words)
-            if score > best_score:
+            match, score = linen_craft.match_erp_to_lc(item.item_name, [p])
+            if match and score > best_score:
                 best_score = score
                 best_item = item
         doc.append("items", {
             "supplier": "Linen Craft Pvt Ltd",
             "source": "Linen Craft Sheet",
-            "item_code": best_item.item_code if best_item and best_score >= 2 else "",
-            "item_name": best_item.item_name if best_item and best_score >= 2 else "",
+            "item_code": best_item.item_code if best_item and best_score >= 1 else "",
+            "item_name": best_item.item_name if best_item and best_score >= 1 else "",
             "vendor_code": p["code"],
             "vendor_name": p["name"],
             "stock_qty": p["available"],
             "status": p["status"],
-            "erp_updated": 1 if best_item and best_score >= 2 else 0,
+            "erp_updated": 1 if best_item and best_score >= 1 else 0,
             "details": f"Stock: {p['stock']}, Committed: {p['committed']}, Available: {p['available']}"
         })
 
@@ -477,11 +564,29 @@ def add_items_to_log(doc, agora_data, lc_data, ddecor_data):
             "details": f"Matched: {r.get('product_name', '')}"
         })
 
+    # Sarom items
+    for m in sarom_data.get("matched", []):
+        stock_val = 999 if m["status"] == "IN_STOCK" else (1 if m["status"] == "LOW_STOCK" else 0)
+        doc.append("items", {
+            "supplier": "Sarom",
+            "source": "Sarom Email",
+            "item_code": m.get("item_code", ""),
+            "item_name": m.get("item_name", ""),
+            "vendor_code": f"{m.get('collection', '')} / {m.get('serial', '')}",
+            "stock_qty": stock_val,
+            "status": m.get("status", ""),
+            "erp_updated": 1,
+            "details": f"Match: {m.get('method', '')} | EDD: {m.get('edd', '')}",
+        })
+
+
 # ==========================================
 # EMAIL
 # ==========================================
-def send_email(doc, excel_path):
+def send_email(doc, excel_path, sarom_data=None):
     """Email the report using smtplib."""
+    if sarom_data is None:
+        sarom_data = {"matched": [], "total": 0, "in_stock": 0, "out_of_stock": 0, "low_stock": 0}
     log("  Sending email...")
     try:
         import smtplib
@@ -502,10 +607,11 @@ def send_email(doc, excel_path):
         <h3>Vendor Stock Scrape Report</h3>
         <p><b>Date:</b> {doc.run_date} | <b>Status:</b> {doc.overall_status} | <b>Duration:</b> {doc.run_duration_mins} mins</p>
         <table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse">
-            <tr style="background:#2F5496;color:white"><th>Vendor</th><th>Status</th><th>Total</th><th>In Stock</th><th>Out</th><th>Low (&lt;20m)</th></tr>
+            <tr style="background:#2F5496;color:white"><th>Vendor</th><th>Status</th><th>Total</th><th>In Stock</th><th>Out</th><th>Low</th></tr>
             <tr><td>Agora</td><td>{doc.agora_status}</td><td>{doc.agora_total}</td><td>{doc.agora_in_stock}</td><td>{doc.agora_out_of_stock}</td><td>{doc.agora_low_stock}</td></tr>
             <tr><td>Linen Craft</td><td>{doc.lc_status}</td><td>{doc.lc_total}</td><td>{doc.lc_in_stock}</td><td>{doc.lc_out_of_stock}</td><td>{doc.lc_low_stock}</td></tr>
             <tr><td>DDécor</td><td>{doc.ddecor_status}</td><td>{doc.ddecor_total}</td><td>{doc.ddecor_in_stock}</td><td>{doc.ddecor_out_of_stock}</td><td>{doc.ddecor_low_stock}</td></tr>
+            <tr><td>Sarom</td><td>{"Success" if sarom_data.get("matched") else "Failed"}</td><td>{sarom_data.get("total", 0)}</td><td>{sarom_data.get("in_stock", 0)}</td><td>{sarom_data.get("out_of_stock", 0)}</td><td>{sarom_data.get("low_stock", 0)}</td></tr>
         </table>
         <p><b>ERP Items Updated:</b> {doc.erp_items_updated}</p>
         <p>Full log: <a href="https://erp.cozycornerpatios.com/app/vendor-stock-scrape-log/{doc.name}">{doc.name}</a></p>
@@ -543,6 +649,9 @@ def send_email(doc, excel_path):
         doc.save(ignore_permissions=True)
         frappe.db.commit()
         log(f"  Email failed: {e}")
+
+
+# ==========================================
 # MAIN
 # ==========================================
 def main(triggered_by="Scheduled"):
@@ -554,6 +663,7 @@ def main(triggered_by="Scheduled"):
     agora_data = {"products": [], "total": 0}
     lc_data = {"products": [], "total": 0}
     ddecor_data = {"results": [], "total": 0}
+    sarom_data = {"matched": [], "unmatched": [], "total": 0}
     erp_updated = 0
     excel_path = None
 
@@ -597,27 +707,40 @@ def main(triggered_by="Scheduled"):
             errors.append(f"DDécor: {str(e)[:200]}")
             ddecor_data["error"] = str(e)[:500]
 
-        # 4. EXCEL
+        # 4. SAROM
         log(f"\n{'=' * 50}")
-        log("4. EXCEL REPORT")
+        log("4. SAROM")
         log("=" * 50)
         try:
-            excel_path = generate_excel(agora_data, lc_data, ddecor_data)
+            sarom_data = sarom.scrape(log_fn=log)
+            if sarom_data.get("matched"):
+                erp_updated += sync_sarom_to_erp(sarom_data["matched"])
+        except Exception as e:
+            log(f"  SAROM FAILED: {e}")
+            errors.append(f"Sarom: {str(e)[:200]}")
+            sarom_data["error"] = str(e)[:500]
+
+        # 5. EXCEL
+        log(f"\n{'=' * 50}")
+        log("5. EXCEL REPORT")
+        log("=" * 50)
+        try:
+            excel_path = generate_excel(agora_data, lc_data, ddecor_data, sarom_data)
         except Exception as e:
             log(f"  EXCEL FAILED: {e}")
             errors.append(f"Excel: {str(e)[:200]}")
 
-        # 5. UPDATE LOG
+        # 6. UPDATE LOG
         log(f"\n{'=' * 50}")
-        log("5. UPDATING SCRAPE LOG")
+        log("6. UPDATING SCRAPE LOG")
         log("=" * 50)
-        update_scrape_log(scrape_log, agora_data, lc_data, ddecor_data, erp_updated, excel_path, errors)
+        update_scrape_log(scrape_log, agora_data, lc_data, ddecor_data, sarom_data, erp_updated, excel_path, errors)
 
-        # 6. EMAIL
+        # 7. EMAIL
         log(f"\n{'=' * 50}")
-        log("6. EMAIL")
+        log("7. EMAIL")
         log("=" * 50)
-        send_email(scrape_log, excel_path)
+        send_email(scrape_log, excel_path, sarom_data)
 
     except Exception as e:
         log(f"\nFATAL ERROR: {e}")

@@ -27,3 +27,9 @@ EMAIL_RECIPIENTS = ["sahil@cozycornerpatios.com"]
 
 # Thresholds
 LOW_STOCK_THRESHOLD = 20
+# Sarom (Gmail IMAP)
+SAROM_IMAP_HOST = "imap.gmail.com"
+SAROM_IMAP_EMAIL = os.getenv("SAROM_IMAP_EMAIL", "etsy@cozycornerpatios.com")
+SAROM_IMAP_PASSWORD = os.getenv("SAROM_IMAP_PASSWORD", "")
+SAROM_SENDER = "order@sarom.info"
+SAROM_SUBJECT = "Sarom Stock Details"

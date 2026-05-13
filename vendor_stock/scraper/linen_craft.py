@@ -1,4 +1,5 @@
 # vendor_stock/scraper/linen_craft.py
+import re
 import time
 import io
 import requests
@@ -59,3 +60,54 @@ def scrape(log_fn=print):
         "stock_date": stock_date,
         "duration": duration
     }
+
+
+def match_erp_to_lc(erp_item_name, products):
+    """
+    Match an ERP item to a Linen Craft product using multiple strategies:
+    1. Keyword overlap (splitting on spaces AND dashes)
+    2. Fabric code fallback (extract numeric code from ERP name, match to LC code)
+
+    Returns (best_match, score) or (None, 0)
+    """
+    # Strategy 1: Keyword overlap with dash-splitting
+    erp_words = set(w.upper() for w in re.split(r'[\s\-]+', erp_item_name) if len(w) > 2)
+    best_match = None
+    best_score = 0
+
+    for p in products:
+        sheet_words = set(w.upper() for w in re.split(r'[\s\-]+', p["name"]) if len(w) > 2)
+        score = len(erp_words & sheet_words)
+        if score > best_score:
+            best_score = score
+            best_match = p
+
+    if best_match and best_score >= 2:
+        return best_match, best_score
+
+    # Strategy 2: Fabric code fallback
+    # Extract potential fabric codes from the ERP item name
+    # Patterns: "5489-0000", "8060-0000", "48031-0000", "SJAWA 5453", "F029", "P012", "10104"
+    code_patterns = re.findall(r'\b(\d{4,5})\b', erp_item_name)
+
+    if code_patterns:
+        for fabric_code in code_patterns:
+            for p in products:
+                lc_code_clean = p["code"].replace(" ", "")
+                if fabric_code == lc_code_clean:
+                    return p, 1  # score 1 = code match
+
+            # Also try with "SJAWA" prefix for waterproof items
+            for p in products:
+                lc_code_clean = p["code"].replace(" ", "")
+                if "SJAWA" + fabric_code == lc_code_clean:
+                    return p, 1
+
+    # Strategy 3: Short alpha codes like F029, P012
+    alpha_codes = re.findall(r'\b([A-Z]\d{3})\b', erp_item_name.upper())
+    for ac in alpha_codes:
+        for p in products:
+            if ac in p["code"].replace(" ", "").upper():
+                return p, 1
+
+    return None, 0

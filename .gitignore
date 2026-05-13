@@ -5,3 +5,7 @@
 tags
 node_modules
 __pycache__
+*.log
+.env
+vendor_stock/scraper/logs/
+vendor_stock/scraper/*.bak
