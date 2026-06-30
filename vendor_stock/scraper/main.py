@@ -734,6 +734,8 @@ def main(triggered_by="Scheduled"):
         log(f"\n{'=' * 50}")
         log("6. UPDATING SCRAPE LOG")
         log("=" * 50)
+        frappe.connect()
+        scrape_log.reload()
         update_scrape_log(scrape_log, agora_data, lc_data, ddecor_data, sarom_data, erp_updated, excel_path, errors)
 
         # 7. EMAIL
