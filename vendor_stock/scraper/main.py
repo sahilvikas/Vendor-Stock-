@@ -128,6 +128,7 @@ def sync_ddecor_to_erp(results):
     """Update ERP items with DDécor stock data."""
     log("  Syncing DDécor to ERP...")
     updated = 0
+    skipped = 0
     now = frappe.utils.now()
 
     for r in results:
@@ -146,6 +147,10 @@ def sync_ddecor_to_erp(results):
             pass
 
         status = r.get("status", "ERROR")
+        # Skip error statuses — keep last known stock in ERP
+        if status in ("ERROR", "COLLECTION_NOT_FOUND", "SERIAL_NOT_FOUND", "NO_POPUP"):
+            skipped += 1
+            continue
         price = r.get("price", "")
 
         try:
@@ -160,7 +165,7 @@ def sync_ddecor_to_erp(results):
             log(f"    Error updating {item_code}: {e}")
 
     frappe.db.commit()
-    log(f"  DDécor: {updated}/{len(results)} items updated in ERP")
+    log(f"  DDécor: {updated}/{len(results)} items updated in ERP ({skipped} skipped due to errors)")
     return updated
 
 
