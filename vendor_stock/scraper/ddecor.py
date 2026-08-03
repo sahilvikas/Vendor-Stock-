@@ -1,4 +1,5 @@
 # vendor_stock/scraper/ddecor.py
+import re
 import csv
 import os
 import time
@@ -202,7 +203,17 @@ def read_popup(page):
     try:
         stock_el = page.locator("text=Total Stock").first
         if stock_el.is_visible():
-            data["total_stock"] = stock_el.inner_text().split(":")[-1].strip()
+            # DOM is <strong>Total Stock:</strong>206 mtrs — the number is a
+            # sibling text node of the <strong>, so inner_text() on the strong
+            # alone returns only "Total Stock:". Read the PARENT div instead.
+            parent = stock_el.locator("xpath=..")
+            raw = parent.inner_text()   # e.g. "Total Stock:206 mtrs"
+            m = re.search(r"Total\s*Stock:\s*([\d,]+\.?\d*)", raw)
+            if m:
+                data["total_stock"] = m.group(1).replace(",", "")
+            else:
+                # fallback to old behaviour in case DOM reverts
+                data["total_stock"] = stock_el.inner_text().split(":")[-1].strip()
     except:
         pass
     try:
