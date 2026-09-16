@@ -14,7 +14,10 @@ from datetime import datetime
 # ==========================================
 # BOOTSTRAP FRAPPE
 # ==========================================
-BENCH_PATH = os.path.expanduser("~/frappe-bench")
+BENCH_PATH = os.environ.get("BENCH_PATH") or os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..")
+)
+os.chdir(os.path.join(BENCH_PATH, "sites"))
 sys.path.insert(0, os.path.join(BENCH_PATH, "apps", "frappe"))
 sys.path.insert(0, os.path.join(BENCH_PATH, "apps", "erpnext"))
 
